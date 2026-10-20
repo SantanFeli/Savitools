@@ -25,21 +25,156 @@ export interface AuthUser {
 
 interface ApiErrorBody {
   message?: string | string[];
+  error?: string;
   /** Machine-readable rejection reason, e.g. CLAWBACK_NOT_ENABLED. */
   code?: string;
+  /** Correlation id from the API exception envelope. */
+  requestId?: string | null;
+}
+
+export type ApiErrorKind =
+  | 'network'
+  | 'timeout'
+  | 'unauthorized'
+  | 'forbidden'
+  | 'validation'
+  | 'not_found'
+  | 'server'
+  | 'unknown';
+
+export interface ApiErrorOptions {
+  kind: ApiErrorKind;
+  message: string;
+  status?: number;
+  code?: string;
+  requestId?: string;
+  cause?: unknown;
+}
+
+/**
+ * Typed failure shared by every `apiFetch` caller.
+ *
+ * `message` is already safe to render: it comes from the API envelope (or a
+ * client-side fallback), never from a raw response body. `requestId` is the
+ * server correlation id and can be shown to support without leaking payloads.
+ */
+export class ApiError extends Error {
+  readonly kind: ApiErrorKind;
+  readonly status?: number;
+  readonly code?: string;
+  readonly requestId?: string;
+  readonly retryable: boolean;
+
+  constructor(options: ApiErrorOptions) {
+    super(options.message);
+    this.name = 'ApiError';
+    this.kind = options.kind;
+    this.status = options.status;
+    this.code = options.code;
+    this.requestId = options.requestId;
+    this.retryable =
+      options.kind === 'network' || options.kind === 'timeout' || options.kind === 'server';
+    if (options.cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
+/** Default client-side deadline for an API request. */
+export const DEFAULT_API_TIMEOUT_MS = 20_000;
+
+export function classifyHttpStatus(status: number): ApiErrorKind {
+  if (status === 408 || status === 504) return 'timeout';
+  if (status === 401) return 'unauthorized';
+  if (status === 403) return 'forbidden';
+  if (status === 404) return 'not_found';
+  if (status === 400 || status === 422) return 'validation';
+  if (status >= 500) return 'server';
+  return 'unknown';
+}
+
+function readMessage(body: ApiErrorBody, response: Response): string {
+  if (Array.isArray(body.message)) return body.message.join(', ');
+  if (typeof body.message === 'string' && body.message.trim()) {
+    return body.message;
+  }
+  if (typeof body.error === 'string' && body.error.trim()) return body.error;
+  return response.statusText || `HTTP ${response.status}`;
+}
+
+function readRequestId(body: ApiErrorBody, response: Response): string | undefined {
+  if (typeof body.requestId === 'string' && body.requestId.trim()) {
+    return body.requestId;
+  }
+  const header = response.headers?.get?.('x-request-id');
+  return header?.trim() || undefined;
+}
+
+async function errorFromResponse(response: Response): Promise<ApiError> {
+  const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
+  return new ApiError({
+    kind: classifyHttpStatus(response.status),
+    status: response.status,
+    message: readMessage(body, response),
+    code: typeof body.code === 'string' ? body.code : undefined,
+    requestId: readRequestId(body, response),
+  });
+}
+
+/** Normalise anything thrown by a transport into the shared taxonomy. */
+export function normalizeApiError(error: unknown, fallback = 'Something went wrong'): ApiError {
+  if (error instanceof ApiError) return error;
+
+  if (
+    error instanceof DOMException &&
+    (error.name === 'AbortError' || error.name === 'TimeoutError')
+  ) {
+    return new ApiError({
+      kind: 'timeout',
+      message: 'The request timed out. Please try again.',
+      cause: error,
+    });
+  }
+
+  if (error instanceof Error) {
+    const text = `${error.name}: ${error.message}`;
+    if (/timeout|timed out|abort/i.test(text)) {
+      return new ApiError({
+        kind: 'timeout',
+        message: 'The request timed out. Please try again.',
+        cause: error,
+      });
+    }
+    if (
+      error.name === 'NetworkError' ||
+      /failed to fetch|fetch failed|networkerror|load failed|network request failed/i.test(text)
+    ) {
+      return new ApiError({
+        kind: 'network',
+        message: 'Could not reach the API. Check your connection and try again.',
+        cause: error,
+      });
+    }
+    return new ApiError({
+      kind: 'unknown',
+      message: error.message || fallback,
+      cause: error,
+    });
+  }
+
+  return new ApiError({ kind: 'unknown', message: fallback, cause: error });
+}
+
+/** Render a typed error, including the safe server correlation id if present. */
+export function apiErrorMessage(error: unknown, fallback = 'Something went wrong'): string {
+  const normalized = normalizeApiError(error, fallback);
+  const message = normalized.message || fallback;
+  return normalized.requestId ? `${message} (Request ID: ${normalized.requestId})` : message;
 }
 
 async function parseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
-    const message = Array.isArray(body.message)
-      ? body.message.join(', ')
-      : (body.message ?? response.statusText);
-    const error = new Error(message) as Error & { code?: string };
-    if (body.code) {
-      error.code = body.code;
-    }
-    throw error;
+    throw await errorFromResponse(response);
   }
 
   if (response.status === 204) {
@@ -49,17 +184,50 @@ async function parseJson<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${API_URL}/v1${path}`, {
-    ...init,
-    credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init.headers ?? {}),
-    },
-  });
+export interface ApiRequestInit extends RequestInit {
+  /** Per-request deadline; defaults to `DEFAULT_API_TIMEOUT_MS`. */
+  timeoutMs?: number;
+}
 
-  return parseJson<T>(response);
+export async function apiFetch<T>(path: string, init: ApiRequestInit = {}): Promise<T> {
+  const { timeoutMs = DEFAULT_API_TIMEOUT_MS, signal, ...requestInit } = init;
+  const controller = new AbortController();
+  let timedOut = false;
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+
+  try {
+    const response = await fetch(`${API_URL}/v1${path}`, {
+      ...requestInit,
+      credentials: 'include',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(requestInit.headers ?? {}),
+      },
+    });
+
+    return await parseJson<T>(response);
+  } catch (error) {
+    if (timedOut) {
+      throw new ApiError({
+        kind: 'timeout',
+        message: `The request timed out after ${timeoutMs}ms. Please try again.`,
+        cause: error,
+      });
+    }
+    throw normalizeApiError(error);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function downloadCsv(path: string, filename: string): Promise<void> {
@@ -68,16 +236,17 @@ export async function downloadCsv(path: string, filename: string): Promise<void>
    * with a file attachment and triggers a browser download. Used by the monitor
    * CSV export and the inspector transaction export (see Savitura/Savitools#195).
    */
-  const response = await fetch(`${API_URL}/v1${path}`, {
-    credentials: 'include',
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}/v1${path}`, {
+      credentials: 'include',
+    });
+  } catch (error) {
+    throw normalizeApiError(error);
+  }
 
   if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
-    const message = Array.isArray(body.message)
-      ? body.message.join(', ')
-      : (body.message ?? response.statusText);
-    throw new Error(message);
+    throw await errorFromResponse(response);
   }
 
   const blob = await response.blob();
@@ -335,11 +504,16 @@ interface ContractInfo {
 }
 
 async function apiFetchFormData<T>(path: string, formData: FormData): Promise<T> {
-  const response = await fetch(`${API_URL}/v1${path}`, {
-    method: 'POST',
-    credentials: 'include',
-    body: formData,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}/v1${path}`, {
+      method: 'POST',
+      credentials: 'include',
+      body: formData,
+    });
+  } catch (error) {
+    throw normalizeApiError(error);
+  }
 
   return parseJson<T>(response);
 }
